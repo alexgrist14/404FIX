@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shikimori 404 Fix
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.5.1
 // @description  Fetch anime info and render 404 pages.
 // @author       404FT
 // @match        https://shikimori.one/*
@@ -3401,31 +3401,109 @@
 		}
 	};
 
-	// Ручное востоновление
-	// пример: restorePage(855, "anime")
-	window.restorePage = async (id, type, displayType) => {
-		renderEntityPage(id, type, displayType);
-		log(`🔄 Ручное восстановление ${displayType || type} ID: ${id}`);
-	};
+    // Документация по:
+    // - init()
+    // - debugInit()
+    // - restorePage()
+	//
+    // 1. Обычный запуск (авто-режим на 404 странице):
+    // init();
+    //
+    // 2. Явный запуск на текущем URL:
+    // init(window.location.href);
+    //
+    // 3. Ручной запуск другого URL (НО с 404-guard):
+    // init("https://shikimori.io/animes/62584-title");
+    //
+    // 4. Принудительный запуск (игнорирует 404 проверку):
+    // init("https://shikimori.io/animes/62584-title", { force: true });
+    //
+    // 5. Debug-алиас (то же самое что force:true):
+    // debugInit("https://shikimori.io/animes/62584-title");
+    //
+    // 6. Из консоли браузера:
+    // init()
+    // init(url)
+    // debugInit(url)
+    //
+    // 7. Ручное восстановление страницы по ID и типу (без проверки URL и 404):
+    // restorePage(855, "anime")
+    // restorePage(123, "anime", "anime")
 
-    const init = () => {
-        if (document.title.trim() !== "404") return;
-
-        // Обновляем regex для поддержки ranobe
-        const match = location.pathname.match(/\/(animes|mangas|ranobe)\/([a-z0-9]+)/);
-        if (!match) return;
-
-        const typePlural = match[1];
-        let id = match[2];
-        id = id.replace(/\D/g, "");
-
-        // ranobe использует тот же API что и manga
-        const type = typePlural === 'ranobe' ? 'manga' : typePlural.slice(0, -1);
-        // Но для шаблона нам нужен оригинальный тип
-        const displayType = typePlural === 'ranobe' ? 'ranobe' : typePlural.slice(0, -1);
-
-        showLoader();
+    window.restorePage = async (id, type, displayType) => {
         renderEntityPage(id, type, displayType);
+        log(`🔄 Ручное восстановление ${displayType || type} ID: ${id}`);
+    };
+
+    const init = (testUrl = window.location.href, options = {}) => {
+        // testUrl — используется для ручного дебага из консоли
+        // по умолчанию берётся текущий URL страницы
+        const url = new URL(testUrl);
+        const pathname = url.pathname;
+
+        // Запускаем только на страницах:
+        // /animes/*
+        // /mangas/*
+        // /ranobe/*
+        const match = pathname.match(/^\/(animes|mangas|ranobe)\/([a-z0-9-]+)/i);
+        if (!match) {
+            console.log('[INIT] no route match');
+            return;
+        }
+
+        // Проверяем, что это действительно 404-страница
+        // По умолчанию выполняется только на 404 страницах
+        // options.force отключает это поведение (debug mode)
+        const title = document.title.trim();
+
+        if (!options.force && !/^404(\s|$)/i.test(title)) {
+            console.log('[INIT] not 404 page');
+            return;
+        }
+
+        // Кастомная страница загрузки (заглушка)
+        // const custom404Html = '...';
+        // document.documentElement.innerHTML = custom404Html;
+
+        const typePlural = match[1].toLowerCase();
+
+        // Из slug вида "855-strawberry-panic" получаем числовой ID
+        const idMatch = match[2].match(/^(\d+)/);
+        if (!idMatch) {
+            console.log('[INIT] no numeric id');
+            return;
+        }
+
+        const id = idMatch[1];
+
+        // Для API ranobe использует тип manga
+        const type = typePlural === 'ranobe'
+        ? 'manga'
+        : typePlural.slice(0, -1);
+
+        // Для отображения сохраняем исходный тип
+        const displayType = typePlural === 'ranobe'
+        ? 'ranobe'
+        : typePlural.slice(0, -1);
+
+        console.log('[INIT] resolved:', {
+            id,
+            type,
+            displayType
+        });
+
+        // Тестовый режим логики
+        if (typeof showLoader === 'function') {
+            showLoader();
+        } else {
+            console.log('[INIT] showLoader() skipped (not defined)');
+        }
+
+        if (typeof renderEntityPage === 'function') {
+            renderEntityPage(id, type, displayType);
+        } else {
+            console.log('[INIT] renderEntityPage skipped (not defined)');
+        }
     };
 
 	// ================================
@@ -3433,6 +3511,12 @@
 	// ================================
 	document.addEventListener("page:load", init);
 	document.addEventListener("turbolinks:load", init);
+
+    // делаем доступным из консоли
+    window.init = init;
+
+    // debug-алиас
+    window.debugInit = (url) => init(url, { force: true });
 
 	// Запуск при обычной загрузке
 	if (document.readyState === "loading") {
