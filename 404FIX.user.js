@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shikimori 404 Fix
 // @namespace    http://tampermonkey.net/
-// @version      2.5.1
+// @version      2.5.2
 // @description  Fetch anime info and render 404 pages.
 // @author       404FT
 // @match        https://shikimori.one/*
@@ -3468,7 +3468,7 @@
         const typePlural = match[1].toLowerCase();
 
         // Из slug вида "855-strawberry-panic" получаем числовой ID
-        const idMatch = match[2].match(/^(\d+)/);
+        const idMatch = match[2].match(/^(?:z)?(\d+)(?:-|$)/i);
         if (!idMatch) {
             console.log('[INIT] no numeric id');
             return;
