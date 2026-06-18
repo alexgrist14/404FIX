@@ -1,0 +1,4 @@
+.claude/
+node_modules/
+.verify/node_modules/
+tools/.deleted-ids.progress.json

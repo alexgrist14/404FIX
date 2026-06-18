@@ -1,0 +1,578 @@
+// ==UserScript==
+// @name         Shikimori — постер с MyAnimeList
+// @namespace    https://github.com/local/shikimori-mal-poster
+// @version      1.4.0
+// @description  Постеры MAL: аниме/манга — карточка, каталог, списки в профиле
+// @match        *://shikimori.one/*
+// @match        *://shikimori.io/*
+// @match        *://*.shikimori.one/*
+// @match        *://*.shikimori.io/*
+// @connect      api.myanimelist.net
+// @grant        GM.xmlHttpRequest
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  /** Client ID: https://myanimelist.net/apiconfig */
+  const MAL_CLIENT_ID = "165ecd52dd8413bebdc52dcd4b57577d";
+
+  const MISSING_MAIN_RE = /\/assets\/globals\/missing\/main(@2x)?\.png/;
+  const MISSING_CATALOG_RE =
+    /\/assets\/globals\/missing\/preview_animanga(@2x)?\.png/;
+
+  /** @type {Map<string, string>} ключ "anime:123" | "manga:123" | "ranobe:123" → mal id */
+  const malIdByShikiKey = new Map();
+
+  let malIo = null;
+  const malMos = [];
+  let malKickTimer = 0;
+  let malScrollAttached = false;
+
+  const malQueue = [];
+  const malQueued = new WeakSet();
+  let malDraining = false;
+
+  const MAL_BATCH = 4;
+  const VIEW_MARGIN = 400;
+
+  function isUserAnimeListPage() {
+    return /^\/[^/]+\/list\/anime/.test(location.pathname);
+  }
+
+  function isUserMangaListPage() {
+    return /^\/[^/]+\/list\/manga/.test(location.pathname);
+  }
+
+  function isUserListLinesPage() {
+    return isUserAnimeListPage() || isUserMangaListPage();
+  }
+
+  function entryKey(info) {
+    return `${info.kind}:${info.id}`;
+  }
+
+  function shikimoriDetailFromPath() {
+    let m = location.pathname.match(/^\/animes\/(\d+)/);
+    if (m) return { id: m[1], kind: "anime" };
+    m = location.pathname.match(/^\/mangas\/(\d+)/);
+    if (m) return { id: m[1], kind: "manga" };
+    m = location.pathname.match(/^\/ranobe\/(\d+)/);
+    if (m) return { id: m[1], kind: "ranobe" };
+    return null;
+  }
+
+  function gmGet(url, headers) {
+    return new Promise((resolve, reject) => {
+      GM.xmlHttpRequest({
+        method: "GET",
+        url,
+        headers: headers || {},
+        onload(r) {
+          if (r.status >= 200 && r.status < 300) resolve(r.responseText);
+          else reject(new Error(`HTTP ${r.status}: ${url}`));
+        },
+        onerror: () => reject(new Error(`Network: ${url}`)),
+        ontimeout: () => reject(new Error(`Timeout: ${url}`)),
+      });
+    });
+  }
+
+  async function resolveMalFromShiki(shikiId, shikiKind) {
+    const cacheKey = `${shikiKind}:${shikiId}`;
+    if (malIdByShikiKey.has(cacheKey)) {
+      return malIdByShikiKey.get(cacheKey);
+    }
+    const apiSegment =
+      shikiKind === "anime"
+        ? `animes/${shikiId}`
+        : shikiKind === "manga"
+          ? `mangas/${shikiId}`
+          : `ranobe/${shikiId}`;
+    let malId = shikiId;
+    try {
+      const r = await fetch(`${location.origin}/api/${apiSegment}`, {
+        headers: { Accept: "application/json" },
+      });
+      if (!r.ok) throw new Error(String(r.status));
+      const data = await r.json();
+      if (data.myanimelist_id != null) malId = String(data.myanimelist_id);
+    } catch (_) {
+      /* оставляем shikiId */
+    }
+    malIdByShikiKey.set(cacheKey, malId);
+    return malId;
+  }
+
+  /** @param {'anime'|'manga'} malEntity — на MAL ранобэ в API как manga */
+  async function fetchMalMainPicture(malId, malEntity) {
+    const segment = malEntity === "anime" ? "anime" : "manga";
+    const url = `https://api.myanimelist.net/v2/${segment}/${encodeURIComponent(
+      malId,
+    )}?fields=main_picture`;
+    const json = await gmGet(url, { "X-MAL-CLIENT-ID": MAL_CLIENT_ID });
+    const data = JSON.parse(json);
+    return data.main_picture || null;
+  }
+
+  function malEntityForShikiKind(shikiKind) {
+    return shikiKind === "anime" ? "anime" : "manga";
+  }
+
+  function applyPoster(posterRoot, picture) {
+    if (!picture || (!picture.large && !picture.medium)) return;
+
+    const large = picture.large || picture.medium;
+    const medium = picture.medium || picture.large;
+    const meta = posterRoot.querySelector('meta[itemprop="image"]');
+    const img = posterRoot.querySelector("img");
+    if (meta) meta.setAttribute("content", large);
+    if (img) {
+      img.src = medium;
+      img.srcset = `${large} 2x, ${medium} 1x`;
+      img.removeAttribute("data-src");
+    }
+  }
+
+  function applyCatalogPoster(row, picture) {
+    if (!picture || (!picture.large && !picture.medium)) return;
+    const large = picture.large || picture.medium;
+    const medium = picture.medium || picture.large;
+    const img = row.querySelector(".image-cutter img");
+    const metaImage = row.querySelector('meta[itemprop="image"]');
+    const metaThumb = row.querySelector('meta[itemprop="thumbnailUrl"]');
+    if (metaImage) metaImage.setAttribute("content", large);
+    if (metaThumb) metaThumb.setAttribute("content", medium);
+    if (img) {
+      img.src = medium;
+      img.srcset = `${large} 2x, ${medium} 1x`;
+      img.removeAttribute("data-src");
+    }
+  }
+
+  function applyLineListPoster(tr, picture) {
+    if (!picture || (!picture.large && !picture.medium)) return;
+    const tdName = tr.querySelector("td.name");
+    if (!tdName) return;
+    const large = picture.large || picture.medium;
+    const medium = picture.medium || picture.large;
+    let wrap = tr.querySelector(".mal-userlist-poster");
+    if (!wrap) {
+      wrap = document.createElement("span");
+      wrap.className = "mal-userlist-poster";
+      wrap.style.cssText =
+        "display:inline-block;vertical-align:middle;margin:0 10px 0 0;width:40px;";
+      const img = document.createElement("img");
+      img.alt = "";
+      img.style.cssText =
+        "display:block;width:40px;height:56px;object-fit:cover;border-radius:4px;";
+      wrap.appendChild(img);
+      tdName.insertBefore(wrap, tdName.firstChild);
+    }
+    const img = wrap.querySelector("img");
+    if (img) {
+      img.src = medium;
+      img.srcset = `${large} 2x, ${medium} 1x`;
+    }
+  }
+
+  function malClientConfigured() {
+    return (
+      MAL_CLIENT_ID &&
+      MAL_CLIENT_ID !== "PASTE_YOUR_MAL_CLIENT_ID_HERE"
+    );
+  }
+
+  let detailRunning = false;
+
+  async function tryFixPoster() {
+    if (detailRunning) return;
+    const detail = shikimoriDetailFromPath();
+    if (!detail) return;
+
+    const poster = document.querySelector(".c-poster");
+    if (!poster) return;
+
+    const img = poster.querySelector("img");
+    if (!img || !MISSING_MAIN_RE.test(img.getAttribute("src") || "")) return;
+
+    if (!malClientConfigured()) {
+      console.warn(
+        "[shikimori-mal-poster] Укажите MAL_CLIENT_ID в начале скрипта.",
+      );
+      return;
+    }
+
+    detailRunning = true;
+    try {
+      const malId = await resolveMalFromShiki(detail.id, detail.kind);
+      const picture = await fetchMalMainPicture(
+        malId,
+        malEntityForShikiKind(detail.kind),
+      );
+      applyPoster(poster, picture);
+    } catch (e) {
+      console.warn("[shikimori-mal-poster]", e);
+    } finally {
+      detailRunning = false;
+    }
+  }
+
+  /** @returns {{ id: string, kind: 'anime'|'manga'|'ranobe' } | null} */
+  function getGridEntryInfo(el) {
+    if (el.matches("article.b-catalog_entry.c-anime") && el.id) {
+      return { id: el.id, kind: "anime" };
+    }
+    if (el.matches("article.b-catalog_entry.c-manga") && el.id) {
+      return { id: el.id, kind: "manga" };
+    }
+    if (el.matches(".c-column.user_rate") && el.closest(".list-posters")) {
+      const link = el.querySelector("a.cover[href], a[href]");
+      const href = (link && link.getAttribute("href")) || "";
+      let m = href.match(/\/animes\/(\d+)/);
+      if (m) return { id: m[1], kind: "anime" };
+      m = href.match(/\/mangas\/(\d+)/);
+      if (m) return { id: m[1], kind: "manga" };
+      m = href.match(/\/ranobe\/(\d+)/);
+      if (m) return { id: m[1], kind: "ranobe" };
+      const tid = el.getAttribute("data-target_id");
+      if (tid && /^\d+$/.test(tid)) {
+        if (isUserAnimeListPage()) return { id: tid, kind: "anime" };
+        if (isUserMangaListPage()) return { id: tid, kind: "manga" };
+      }
+    }
+    return null;
+  }
+
+  /** @returns {{ id: string, kind: 'anime'|'manga'|'ranobe' } | null} */
+  function getLineListEntryInfo(tr) {
+    if (!tr.matches("tr.user_rate") || !tr.closest("table.list-lines")) {
+      return null;
+    }
+    const a = tr.querySelector("td.name a[href]");
+    const href = (a && a.getAttribute("href")) || "";
+    let m = href.match(/\/animes\/(\d+)/);
+    if (m && isUserAnimeListPage()) return { id: m[1], kind: "anime" };
+    m = href.match(/\/mangas\/(\d+)/);
+    if (m && isUserMangaListPage()) return { id: m[1], kind: "manga" };
+    m = href.match(/\/ranobe\/(\d+)/);
+    if (m && isUserMangaListPage()) return { id: m[1], kind: "ranobe" };
+
+    const tid = tr.getAttribute("data-target_id");
+    if (tid && /^\d+$/.test(tid)) {
+      if (isUserAnimeListPage()) return { id: tid, kind: "anime" };
+      if (isUserMangaListPage()) return { id: tid, kind: "manga" };
+    }
+    return null;
+  }
+
+  function needsGridPosterFix(el) {
+    const info = getGridEntryInfo(el);
+    if (!info) return false;
+    const img = el.querySelector(".image-cutter img");
+    if (!img || !MISSING_CATALOG_RE.test(img.getAttribute("src") || "")) {
+      return false;
+    }
+    const k = entryKey(info);
+    if (el.dataset.malPosterResolved === k) return false;
+    if (el.dataset.malPosterBusy === k) return false;
+    return true;
+  }
+
+  function needsLineListFix(tr) {
+    if (!isUserListLinesPage()) return false;
+    const info = getLineListEntryInfo(tr);
+    if (!info) return false;
+    const k = entryKey(info);
+    const prev = tr.dataset.malPosterResolved;
+    if (prev && prev !== k) {
+      tr.querySelector(".mal-userlist-poster")?.remove();
+      delete tr.dataset.malPosterResolved;
+    }
+    if (tr.dataset.malPosterResolved === k) return false;
+    if (tr.dataset.malPosterBusy === k) return false;
+    if (tr.querySelector(".mal-userlist-poster")) return false;
+    return true;
+  }
+
+  function needsMalFix(el) {
+    return needsGridPosterFix(el) || needsLineListFix(el);
+  }
+
+  function isNearViewport(el) {
+    const r = el.getBoundingClientRect();
+    const m = VIEW_MARGIN;
+    return (
+      r.bottom > -m &&
+      r.top < window.innerHeight + m &&
+      r.right > -m &&
+      r.left < window.innerWidth + m
+    );
+  }
+
+  function enqueueMalRow(el) {
+    if (!needsMalFix(el)) return;
+    if (malQueued.has(el)) return;
+    malQueued.add(el);
+    malQueue.push(el);
+    void drainMalQueue();
+  }
+
+  async function drainMalQueue() {
+    if (malDraining) return;
+    malDraining = true;
+    try {
+      while (malQueue.length) {
+        const batch = malQueue.splice(0, MAL_BATCH);
+        for (const a of batch) {
+          malQueued.delete(a);
+        }
+        await Promise.all(batch.map((a) => processMalRowSafe(a)));
+      }
+    } finally {
+      malDraining = false;
+      if (malQueue.length) void drainMalQueue();
+    }
+  }
+
+  async function processMalRowSafe(el) {
+    if (el.matches("tr.user_rate") && needsLineListFix(el)) {
+      const info = getLineListEntryInfo(el);
+      if (!info) return;
+      const k = entryKey(info);
+      el.dataset.malPosterBusy = k;
+      try {
+        await processLineListRow(el, info);
+      } finally {
+        if (el.dataset.malPosterBusy === k) {
+          delete el.dataset.malPosterBusy;
+        }
+      }
+      return;
+    }
+
+    const info = getGridEntryInfo(el);
+    if (!info || !needsGridPosterFix(el)) return;
+    const k = entryKey(info);
+    el.dataset.malPosterBusy = k;
+    try {
+      await processGridPosterRow(el, info);
+    } finally {
+      if (el.dataset.malPosterBusy === k) {
+        delete el.dataset.malPosterBusy;
+      }
+    }
+  }
+
+  async function processLineListRow(tr, info) {
+    const k = entryKey(info);
+    try {
+      const malId = await resolveMalFromShiki(info.id, info.kind);
+      const picture = await fetchMalMainPicture(
+        malId,
+        malEntityForShikiKind(info.kind),
+      );
+      const cur = getLineListEntryInfo(tr);
+      if (!cur || entryKey(cur) !== k) return;
+      if (picture && (picture.medium || picture.large)) {
+        applyLineListPoster(tr, picture);
+      }
+    } catch (_) {
+      /* ignore */
+    }
+
+    const fin = getLineListEntryInfo(tr);
+    if (fin && entryKey(fin) === k) {
+      tr.dataset.malPosterResolved = k;
+    }
+  }
+
+  async function processGridPosterRow(el, info) {
+    const k = entryKey(info);
+    try {
+      const malId = await resolveMalFromShiki(info.id, info.kind);
+      const picture = await fetchMalMainPicture(
+        malId,
+        malEntityForShikiKind(info.kind),
+      );
+      const cur = getGridEntryInfo(el);
+      if (!cur || entryKey(cur) !== k) return;
+      const img = el.querySelector(".image-cutter img");
+      if (
+        !img ||
+        !MISSING_CATALOG_RE.test(img.getAttribute("src") || "")
+      ) {
+        return;
+      }
+      if (picture && (picture.medium || picture.large)) {
+        applyCatalogPoster(el, picture);
+      }
+    } catch (_) {
+      /* ignore */
+    }
+
+    const fin = getGridEntryInfo(el);
+    if (fin && entryKey(fin) === k) {
+      el.dataset.malPosterResolved = k;
+    }
+  }
+
+  function observeMalRow(el) {
+    if (!malIo) return;
+    const ok =
+      el.matches("article.b-catalog_entry.c-anime") ||
+      el.matches("article.b-catalog_entry.c-manga") ||
+      (el.matches(".c-column.user_rate") && el.closest(".list-posters")) ||
+      (el.matches("tr.user_rate") &&
+        el.closest("table.list-lines") &&
+        isUserListLinesPage());
+    if (!ok) return;
+    try {
+      malIo.observe(el);
+    } catch (_) {
+      /* уже в observer */
+    }
+  }
+
+  function wireAllMalRows() {
+    document
+      .querySelectorAll(
+        ".cc-entries article.b-catalog_entry.c-anime, .cc-entries article.b-catalog_entry.c-manga",
+      )
+      .forEach(observeMalRow);
+    document
+      .querySelectorAll(".list-posters .c-column.user_rate")
+      .forEach(observeMalRow);
+    if (isUserListLinesPage()) {
+      document
+        .querySelectorAll("table.b-table.list-lines tbody.entries tr.user_rate")
+        .forEach(observeMalRow);
+    }
+  }
+
+  function kickMalInView() {
+    document
+      .querySelectorAll(
+        ".cc-entries article.b-catalog_entry.c-anime, .cc-entries article.b-catalog_entry.c-manga",
+      )
+      .forEach((el) => {
+        if (needsGridPosterFix(el) && isNearViewport(el)) {
+          enqueueMalRow(el);
+        }
+      });
+    document
+      .querySelectorAll(".list-posters .c-column.user_rate")
+      .forEach((el) => {
+        if (needsGridPosterFix(el) && isNearViewport(el)) {
+          enqueueMalRow(el);
+        }
+      });
+    if (isUserListLinesPage()) {
+      document
+        .querySelectorAll(
+          "table.b-table.list-lines tbody.entries tr.user_rate",
+        )
+        .forEach((tr) => {
+          if (needsLineListFix(tr) && isNearViewport(tr)) {
+            enqueueMalRow(tr);
+          }
+        });
+    }
+  }
+
+  function scheduleMalKick() {
+    clearTimeout(malKickTimer);
+    malKickTimer = setTimeout(() => {
+      wireAllMalRows();
+      kickMalInView();
+    }, 60);
+  }
+
+  function teardownMalEnhancements() {
+    if (malScrollAttached) {
+      window.removeEventListener("scroll", scheduleMalKick, {
+        capture: true,
+      });
+      malScrollAttached = false;
+    }
+    if (malIo) {
+      malIo.disconnect();
+      malIo = null;
+    }
+    while (malMos.length) {
+      malMos.pop().disconnect();
+    }
+    clearTimeout(malKickTimer);
+    malQueue.length = 0;
+  }
+
+  function setupMalVirtualization() {
+    if (!malClientConfigured()) return;
+
+    const moRoots = [];
+    const cc = document.querySelector(".cc-entries");
+    if (cc) moRoots.push(cc);
+    document.querySelectorAll(".list-posters").forEach((lp) => {
+      moRoots.push(lp);
+    });
+    if (isUserListLinesPage()) {
+      document
+        .querySelectorAll("table.b-table.list-lines tbody.entries")
+        .forEach((tb) => {
+          moRoots.push(tb);
+        });
+    }
+
+    if (!moRoots.length) return;
+
+    malIo = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (!e.isIntersecting) continue;
+          const node = e.target;
+          if (needsMalFix(node)) {
+            enqueueMalRow(node);
+          }
+        }
+      },
+      {
+        root: null,
+        rootMargin: `${VIEW_MARGIN}px 0px ${VIEW_MARGIN}px 0px`,
+        threshold: 0,
+      },
+    );
+
+    wireAllMalRows();
+    kickMalInView();
+
+    const moOpts = {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["id", "src", "srcset", "data-target_id", "href"],
+    };
+    for (const root of moRoots) {
+      const mo = new MutationObserver(scheduleMalKick);
+      mo.observe(root, moOpts);
+      malMos.push(mo);
+    }
+
+    window.addEventListener("scroll", scheduleMalKick, {
+      capture: true,
+      passive: true,
+    });
+    malScrollAttached = true;
+  }
+
+  function onNav() {
+    teardownMalEnhancements();
+    tryFixPoster();
+    setupMalVirtualization();
+  }
+
+  document.addEventListener("turbolinks:load", onNav);
+  document.addEventListener("turbo:load", onNav);
+  window.addEventListener("popstate", onNav);
+  onNav();
+})();
